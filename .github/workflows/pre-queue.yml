@@ -1,0 +1,191 @@
+name: Pre-queue
+
+# Prepares a labelled pull request for GitHub's merge queue, which merges
+# everything with a merge commit:
+#   automerge:rebase    fold fixups, drop merge commits, rebase onto the base
+#   automerge:squash    squash to one commit (PR title + body), rebase onto the base
+#   automerge:no-update leave the branch as it is
+# then turns on "merge when ready" so the queue picks it up once checks pass.
+# Replaces autosquash.yml, which only did the first part of automerge:rebase.
+
+on:
+  pull_request_target:
+    types: [labeled, ready_for_review, reopened, synchronize]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pre-queue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  # Test copy: no required reviews on this repo. Set to 'true' in agoric-sdk.
+  REQUIRE_APPROVAL: "false"
+
+jobs:
+  pre-queue:
+    runs-on: ubuntu-latest
+    if: >-
+      github.event.pull_request.base.ref == 'main' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository && (
+        contains(github.event.pull_request.labels.*.name, 'automerge:rebase') ||
+        contains(github.event.pull_request.labels.*.name, 'automerge:squash') ||
+        contains(github.event.pull_request.labels.*.name, 'automerge:no-update')
+      )
+    steps:
+      # Decide from the API so most runs skip cloning the repo.
+      - name: Decide what to do
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+          has_label() { jq -e --arg l "$1" 'index($l) != null' <<<"$LABELS" >/dev/null; }
+
+          decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""')
+          if [ "$REQUIRE_APPROVAL" = true ] && [ "$decision" != APPROVED ]; then
+            echo "Waiting for approval (review decision: ${decision:-none})."
+            exit 0
+          fi
+
+          if has_label automerge:squash; then
+            method=squash
+          elif has_label automerge:rebase; then
+            method=rebase
+          else
+            method=no-update
+          fi
+          if has_label bypass:linear-history; then
+            echo "bypass:linear-history: leaving the branch as it is."
+            method=no-update
+          fi
+
+          priority=false
+          if has_label priority:high; then priority=true; fi
+
+          echo "Method: $method, priority: $priority"
+          {
+            echo "ready=true"
+            echo "method=$method"
+            echo "priority=$priority"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Create app token
+        id: app-token
+        if: steps.plan.outputs.ready == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.AGORIC_CI_BOT_APP_ID }}
+          private-key: ${{ secrets.AGORIC_CI_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
+
+      # Only git runs on the PR's content; nothing from the PR is executed.
+      - uses: actions/checkout@v5
+        if: steps.plan.outputs.ready == 'true' && steps.plan.outputs.method != 'no-update'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # Pushes with the app token so the new head starts CI; the push
+      # re-triggers this workflow, which then finds nothing to do and enqueues.
+      - name: Prepare branch
+        id: prepare
+        if: steps.plan.outputs.ready == 'true' && steps.plan.outputs.method != 'no-update'
+        env:
+          METHOD: ${{ steps.plan.outputs.method }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          upstream="origin/$BASE_REF"
+
+          bot="$APP_SLUG[bot]"
+          bot_id=$(gh api "/users/$bot" --jq .id)
+          git config user.name "$bot"
+          git config user.email "$bot_id+$bot@users.noreply.github.com"
+
+          fail() {
+            echo "::error::$1"
+            gh pr comment "$PR_NUMBER" --body "Pre-queue: $1"
+            exit 1
+          }
+
+          case "$METHOD" in
+            rebase)
+              # Without --rebase-merges this folds fixups, drops merge commits
+              # and rebases onto the latest base in one pass.
+              if ! GIT_SEQUENCE_EDITOR=: GIT_EDITOR=: git rebase --interactive --autosquash "$upstream"; then
+                git rebase --abort
+                fail "rebase onto \`$BASE_REF\` failed; fold fixups and rebase manually."
+              fi
+              leftover=$(git rev-list "$upstream..HEAD" --grep='^\(fixup\|squash\|amend\)! ')
+              if [ -n "$leftover" ]; then
+                fail "fixup commits with no matching target remain; fold them manually."
+              fi
+              ;;
+            squash)
+              base=$(git merge-base "$upstream" HEAD)
+              count=$(git rev-list --count "$base..HEAD")
+              if [ "$count" -gt 1 ] || [ -n "$(git rev-list --merges "$base..HEAD")" ]; then
+                gh pr view "$PR_NUMBER" --json title,body \
+                  --jq '.title + "\n\n" + .body' >"$RUNNER_TEMP/message"
+                # Keep the PR's first author as the squash commit's author.
+                author=$(git log -1 --format='%an <%ae>' "$(git rev-list --reverse --no-merges "$base..HEAD" | head -1)")
+                git reset --soft "$base"
+                git commit --quiet --author "$author" --file "$RUNNER_TEMP/message"
+              fi
+              if ! git rebase "$upstream"; then
+                git rebase --abort
+                fail "rebase onto \`$BASE_REF\` failed; resolve the conflict manually."
+              fi
+              ;;
+          esac
+
+          if [ "$(git rev-parse HEAD)" = "$HEAD_SHA" ]; then
+            echo "Branch already prepared."
+            exit 0
+          fi
+
+          # Refuse to overwrite anything pushed since this run started.
+          git push --force-with-lease="refs/heads/$HEAD_REF:$HEAD_SHA" \
+            origin "HEAD:refs/heads/$HEAD_REF"
+          echo "pushed=true" >>"$GITHUB_OUTPUT"
+          echo "::notice::Prepared ($METHOD) as $(git rev-parse HEAD)."
+
+      # Skipped after a push: the re-triggered run enqueues the new head.
+      - name: Enqueue
+        if: steps.plan.outputs.ready == 'true' && steps.prepare.outputs.pushed != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NODE_ID: ${{ github.event.pull_request.node_id }}
+          PRIORITY: ${{ steps.plan.outputs.priority }}
+        run: |
+          set -euo pipefail
+          # jump only succeeds once the PR can enter the queue (checks passed).
+          if [ "$PRIORITY" = true ] &&
+            gh api graphql -f id="$PR_NODE_ID" -f query='
+              mutation($id: ID!) { enqueuePullRequest(input: {pullRequestId: $id, jump: true}) { clientMutationId } }'; then
+            echo "::notice::Enqueued at the front of the merge queue."
+            exit 0
+          fi
+          # With a merge queue on the base branch, this joins the queue once
+          # checks pass; the queue's own merge method applies.
+          gh pr merge "$PR_NUMBER" --auto --merge
+          echo "::notice::Merge when ready is on."
